@@ -1,0 +1,56 @@
+{
+ "type": "FeatureCollection",
+ "features": [
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     8.6,
+     49.05
+    ]
+   },
+   "properties": {
+    "kind": "cafe",
+    "name": "Central",
+    "open": true
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "MultiPoint",
+    "coordinates": [
+     [
+      8.65,
+      49.06
+     ],
+     [
+      8.66,
+      49.07
+     ]
+    ]
+   },
+   "properties": {
+    "kind": "shop",
+    "name": "Mall",
+    "open": false
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     8.7,
+     49.08
+    ]
+   },
+   "properties": {
+    "kind": "cafe",
+    "name": "Riverside",
+    "open": true
+   }
+  }
+ ]
+}

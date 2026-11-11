@@ -1,0 +1,10 @@
+* text=auto
+*.qml text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.geojson text eol=lf
+*.rgba binary
+*.png binary
+*.ico binary
