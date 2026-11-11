@@ -43,8 +43,8 @@ On Windows (`x86_64-pc-windows-msvc`) this produces the single self-contained
 no admin rights, no external DLLs, no registry writes — all settings live in a
 `config/` folder created next to the executable.
 
-The release binary is roughly **10–12 MB** (built with LTO and symbol stripping;
-exact size depends on toolchain version).
+The release EXE is roughly **5 MB** (built with LTO and symbol stripping; verified
+on the Windows CI runner — exact size depends on toolchain version).
 
 ## Usage
 
