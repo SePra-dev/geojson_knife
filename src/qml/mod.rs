@@ -206,6 +206,12 @@ mod tests {
         StyleProject::default()
     }
 
+    /// Read a golden file, normalizing line endings (git may check out CRLF on Windows).
+    fn read_golden(name: &str) -> String {
+        let raw = std::fs::read_to_string(format!("tests/golden/{name}")).unwrap();
+        raw.replace("\r\n", "\n")
+    }
+
     #[test]
     fn color_string_format() {
         assert_eq!(color_string(Color::new(255, 0, 0, 128)), "255,0,0,128");
@@ -230,7 +236,7 @@ mod tests {
             },
         };
         let xml = generate_qml(&style, GeometryKind::Polygon);
-        let expected = std::fs::read_to_string("tests/golden/single_fill.qml").unwrap();
+        let expected = read_golden("single_fill.qml");
         assert_eq!(xml, expected);
     }
 
@@ -238,7 +244,7 @@ mod tests {
     fn single_symbol_line_matches_golden_file() {
         let style = base_style();
         let xml = generate_qml(&style, GeometryKind::LineString);
-        let expected = std::fs::read_to_string("tests/golden/single_line.qml").unwrap();
+        let expected = read_golden("single_line.qml");
         assert_eq!(xml, expected);
     }
 
@@ -246,7 +252,7 @@ mod tests {
     fn single_symbol_marker_matches_golden_file() {
         let style = base_style();
         let xml = generate_qml(&style, GeometryKind::Point);
-        let expected = std::fs::read_to_string("tests/golden/single_marker.qml").unwrap();
+        let expected = read_golden("single_marker.qml");
         assert_eq!(xml, expected);
     }
 
@@ -256,7 +262,7 @@ mod tests {
         style.renderer = RendererKind::Categorized;
         style.build_categories("type", &["forest".into(), "water<1>".into()]);
         let xml = generate_qml(&style, GeometryKind::Polygon);
-        let expected = std::fs::read_to_string("tests/golden/categorized_fill.qml").unwrap();
+        let expected = read_golden("categorized_fill.qml");
         assert_eq!(xml, expected);
     }
 
