@@ -3,7 +3,7 @@ name = "geojson_knife"
 version = "0.1.0"
 edition = "2021"
 description = "GeoJSON Toolkit - a portable Swiss Army knife for GeoJSON files"
-license = "MIT"
+license = "Apache-2.0"
 default-run = "geojson_knife"
 
 [dependencies]
