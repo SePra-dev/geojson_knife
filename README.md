@@ -59,6 +59,17 @@ on the Windows CI runner — exact size depends on toolchain version).
    *Layer Properties → Symbology → Style → Load Style…* and select the exported
    `.qml`.
 
+- **Data-table editor (Phase 2)**: switch the center view to *Table editor* for a
+  virtualized feature-by-attribute table (only visible rows are rendered, so 50k+
+  rows stay smooth). Right-click a column header to rename it (written back as the
+  property key on export), delete it, or set a per-column filter (contains / equals /
+  numeric range; filters combine with AND logic, shown in the toolbar). Drag column
+  headers to reorder. Structural edits (rename/delete/reorder) are undoable for the
+  session (Ctrl+Z). **Export GeoJSON…** writes an RFC 7946, UTF-8 FeatureCollection
+  that preserves geometries exactly, applies the new column order and renamed keys,
+  and — with the *Export only filtered rows* checkbox — respects or ignores the
+  active filters.
+
 For the full manual QGIS verification procedure see
 [docs/QGIS_TEST.md](docs/QGIS_TEST.md).
 
@@ -90,8 +101,8 @@ cargo test -- --ignored regenerate_golden   # regenerate golden files (review di
 
 ## Roadmap
 
-- **Phase 2** — data-table editor: virtualized table, rename/reorder/delete columns
-  (with undo), per-column filters, GeoJSON export.
+- **Phase 2 (done)** — data-table editor: virtualized table, rename/reorder/delete
+  columns (with undo), per-column filters, GeoJSON export.
 - **Phase 3** — ideas backlog: graduated (class-break) styles with color ramps,
   geometry inspection, CRS info, GeoPackage/SHP import, batch conversion,
   attribute statistics.

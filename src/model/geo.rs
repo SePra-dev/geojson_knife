@@ -93,10 +93,13 @@ impl AttrType {
     }
 }
 
-/// A single feature: geometry kind plus its properties in original file order.
+/// A single feature: geometry kind, the raw geometry value (preserved exactly
+/// for export), and its properties in original file order.
 #[derive(Debug, Clone)]
 pub struct Feature {
     pub kind: GeometryKind,
+    /// Raw `geometry` member, kept verbatim so exports preserve it exactly.
+    pub geometry: Value,
     /// Properties in the order they appear in the file (first feature defines field order).
     pub properties: Vec<(String, Value)>,
 }
@@ -271,6 +274,7 @@ fn feature_from_value(v: &Value, index: usize) -> Result<Feature, GeoJsonError> 
     };
     Ok(Feature {
         kind,
+        geometry: geom.clone(),
         properties: properties_to_vec(obj.get("properties")),
     })
 }
