@@ -1,9 +1,14 @@
 pub mod geo;
 pub mod style;
+pub mod proj;
 pub mod table;
 
 #[allow(unused_imports)]
 pub use geo::{parse_geojson, AttrType, Dataset, Feature, FieldInfo, GeoJsonError, GeometryKind};
+#[allow(unused_imports)]
+pub use geo::compute_extent;
+#[allow(unused_imports)]
+pub use proj::{Crs, ProjError, TransformDirection};
 #[allow(unused_imports)]
 pub use table::{export_geojson, ColumnState, FilterKind, TableState};
 #[allow(unused_imports)]

@@ -105,8 +105,17 @@ cargo test -- --ignored regenerate_golden   # regenerate golden files (review di
   fill/hatch/outline is inherited). Breaks and symbols are listed live and exported
   as a QGIS `graduatedSymbol` renderer.
 - **Geometry inspection & statistics (Phase 3)**: the file panel shows the dataset
-  bounding box (WGS84), total vertex count, and per-attribute numeric statistics
+  bounding box, total vertex count, and per-attribute numeric statistics
   (min/max, sum, mean, standard deviation) alongside distinct values and null counts.
+- **Coordinate transformation (WGS84 ↔ ETRS89 UTM 33N)**: transform every
+  geometry in the loaded dataset between geographic WGS84 lon/lat (EPSG:4326)
+  and ETRS89 / UTM zone 33N (EPSG:25833) with one click — pure math (UTM
+  series after Snyder/Krüger, mm–cm accurate), no PROJ dependency, keeping the
+  single-EXE portability. The current CRS (including EPSG code) and units-aware
+  extent are shown, transformed data exports like any edited dataset, and a
+  warning appears when data lies outside the 12°E–18°E zone. Datum note: the
+  sub-meter ETRS89↔WGS84 datum difference is treated as zero, as is common
+  practice; this changes the map projection only.
 
 ## Roadmap
 
