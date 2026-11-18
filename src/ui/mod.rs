@@ -2,12 +2,24 @@
 //! categorized rendering controls, and export.
 
 use crate::io::{AppSettings, LoadHandle, LoadResult};
-use crate::model::{Dataset, GeometryKind, StyleProject};
+use crate::model::{Dataset, GeometryKind, StyleProject, TableState};
+use crate::model::{export_geojson, FilterKind};
+use crate::model::geo::value_to_string;
+use crate::model::{
+    Category, ClassificationMethod, Color, Fill, Hatch, LineSymbol, PointSymbol, RendererKind,
+};
 use crate::qml;
 use eframe::egui;
 use egui::{Align2, Color32, Pos2, Sense, Vec2};
 
-use crate::model::{Category, Color, Fill, Hatch, LineSymbol, PointSymbol, RendererKind};
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Style,
+    Table,
+}
+
+const COL_WIDTH: f32 = 140.0;
+const ROW_HEIGHT: f32 = 20.0;
 
 pub struct GeoJsonToolkitApp {
     settings: AppSettings,
@@ -22,6 +34,15 @@ pub struct GeoJsonToolkitApp {
     /// Geometry kind used for the preview/export symbol family.
     preview_kind: GeometryKind,
     show_about: bool,
+    view: View,
+    table: TableState,
+    /// Column being renamed (original name) and the edit buffer.
+    rename_edit: Option<(String, String)>,
+    /// Column being filtered (original name) and the filter under edit.
+    filter_edit: Option<(String, FilterKind)>,
+    /// Index of the column currently dragged in the table header.
+    drag_col: Option<usize>,
+    respect_filters_on_export: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -52,6 +73,12 @@ impl Default for GeoJsonToolkitApp {
             selected_attr: None,
             preview_kind: GeometryKind::Polygon,
             show_about: false,
+            view: View::Style,
+            table: TableState::default(),
+            rename_edit: None,
+            filter_edit: None,
+            drag_col: None,
+            respect_filters_on_export: true,
         }
     }
 }
@@ -93,6 +120,10 @@ impl GeoJsonToolkitApp {
                     .copied()
                     .unwrap_or(GeometryKind::Point);
                 self.selected_attr = None;
+                self.table = TableState::from_fields(&ds.fields);
+                self.rename_edit = None;
+                self.filter_edit = None;
+                self.drag_col = None;
                 self.status = format!(
                     "Loaded {name}: {} features, {} attribute(s).",
                     ds.features.len(),
@@ -274,7 +305,14 @@ impl GeoJsonToolkitApp {
                     .map(|k| k.label())
                     .collect();
                 ui.label(format!("Geometry: {}", kinds.join(", ")));
-                ui.label("CRS: WGS84 (RFC 7946)");
+                ui.label("CRS: WGS84 (RFC 7946, longitude/latitude)");
+                ui.label(format!("Vertices: {}", ds.vertex_count));
+                if let Some(bbox) = ds.extent {
+                    ui.label(format!(
+                        "Extent: [{:.5}, {:.5}] – [{:.5}, {:.5}]",
+                        bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y
+                    ));
+                }
             }
             None => {
                 ui.label("No file loaded.");
@@ -323,7 +361,14 @@ impl GeoJsonToolkitApp {
                     ui.label(f.ty.label());
                     match (f.ty, f.num_min, f.num_max) {
                         (crate::model::AttrType::Number, Some(min), Some(max)) => {
-                            ui.label(format!("min {min}, max {max}"));
+                            let stats = match (f.num_mean, f.num_stddev) {
+                                (Some(mean), Some(stddev)) => format!(
+                                    "min {min}, max {max}, Σ {:.0}, mean {mean:.2}, σ {stddev:.2}",
+                                    f.num_sum.unwrap_or_default()
+                                ),
+                                _ => format!("min {min}, max {max}"),
+                            };
+                            ui.label(shorten(&stats, 60));
                         }
                         _ => {
                             let preview = if f.distinct.len() < f.distinct_count {
@@ -354,22 +399,363 @@ impl GeoJsonToolkitApp {
                 });
                 return;
             }
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                self.renderer_controls(ui);
+            ui.horizontal(|ui| {
+                ui.label("View:");
+                ui.selectable_value(&mut self.view, View::Style, "Style designer");
+                ui.selectable_value(&mut self.view, View::Table, "Table editor");
+            });
+            ui.separator();
+            match self.view {
+                View::Style => self.style_designer_panel(ui),
+                View::Table => self.table_editor(ui),
+            }
+            self.focus_dialogs(ui);
+        });
+    }
+
+    fn style_designer_panel(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            self.renderer_controls(ui);
+            ui.separator();
+            match self.preview_kind.symbol_family() {
+                "fill" => self.fill_designer(ui),
+                "line" => self.line_designer(ui),
+                _ => self.point_designer(ui),
+            }
+            ui.separator();
+            self.preview(ui);
+            if self.style.renderer == RendererKind::Categorized {
                 ui.separator();
-                match self.preview_kind.symbol_family() {
-                    "fill" => self.fill_designer(ui),
-                    "line" => self.line_designer(ui),
-                    _ => self.point_designer(ui),
-                }
-                ui.separator();
-                self.preview(ui);
-                if self.style.renderer == RendererKind::Categorized {
-                    ui.separator();
-                    self.category_designer(ui);
+                self.category_designer(ui);
+            }
+        });
+    }
+
+    // ---------- Phase 2: table editor ----------
+
+    /// Virtualized feature-by-attribute table. Only visible rows are rendered
+    /// (egui `ScrollArea::show_rows`), so 50k+ rows stay smooth.
+    fn table_editor(&mut self, ui: &mut egui::Ui) {
+        // Compute row indices up-front (pure logic, borrow of self.table ends here).
+        let (n_visible, indices) = {
+            let Some((_, ds)) = self.dataset.as_ref() else { return; };
+            let idx = self.table.visible_row_indices(&ds.features);
+            (idx.len(), idx)
+        };
+        let total = {
+            let Some((_, ds)) = self.dataset.as_ref() else { return; };
+            ds.features.len()
+        };
+
+        ui.horizontal(|ui| {
+            ui.heading("Table");
+            ui.separator();
+            // Undo for the session (structural edits: delete/rename/reorder).
+            let undo_shortcut = ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z));
+            let undo = ui.add_enabled(self.table.can_undo(), egui::Button::new("Undo (Ctrl+Z)"));
+            if (undo.clicked() || undo_shortcut) && self.table.undo() {
+                self.status = "Undid last structural edit.".into();
+            }
+            ui.separator();
+            ui.checkbox(&mut self.respect_filters_on_export, "Export only filtered rows");
+            if ui.button("Export GeoJSON…").clicked() {
+                self.export_geojson();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.table.active_filter_count() > 0 {
+                    let summaries: Vec<String> = self
+                        .table
+                        .filters
+                        .iter()
+                        .map(|(k, f)| format!("{k} {}", f.label()))
+                        .collect();
+                    ui.colored_label(
+                        Color32::from_rgb(0, 100, 200),
+                        format!("Filter(s): {}", summaries.join(" AND ")),
+                    );
+                    ui.label(format!("{n_visible} of {total} features"));
+                } else {
+                    ui.label(format!("{total} features"));
                 }
             });
         });
+        ui.add_space(4.0);
+
+        let columns: Vec<crate::model::ColumnState> =
+            self.table.active_columns().into_iter().cloned().collect();
+        self.table_header(ui, &columns);
+
+        let empty: Vec<crate::model::Feature> = Vec::new();
+        let features = self
+            .dataset
+            .as_ref()
+            .map(|(_, ds)| &ds.features)
+            .unwrap_or(&empty);
+
+        egui::ScrollArea::vertical()
+            .id_source("table_rows")
+            .show_rows(ui, ROW_HEIGHT, indices.len(), |ui, range| {
+                for row in range {
+                    let f_idx = indices[row];
+                    let f = &features[f_idx];
+                    ui.horizontal(|ui| {
+                        for col in &columns {
+                            let (rect, _) = ui.allocate_exact_size(
+                                Vec2::new(COL_WIDTH - 4.0, ROW_HEIGHT - 2.0),
+                                Sense::click(),
+                            );
+                            let text = f
+                                .get(&col.original)
+                                .map(value_to_string)
+                                .unwrap_or_default();
+                            let text = shorten(&text, 18);
+                            let painter = ui.painter_at(rect);
+                            let is_null = f
+                                .get(&col.original)
+                                .map(|v| v.is_null())
+                                .unwrap_or(true);
+                            let color = if is_null {
+                                Color32::from_gray(170)
+                            } else {
+                                ui.visuals().text_color()
+                            };
+                            painter.text(
+                                rect.min + Vec2::new(4.0, rect.height() / 2.0),
+                                egui::Align2::LEFT_CENTER,
+                                if is_null { "∅" } else { &text },
+                                egui::FontId::proportional(13.0),
+                                color,
+                            );
+                        }
+                    });
+                }
+            });
+    }
+
+    /// Header row with drag & drop column reordering, rename, filter and delete.
+    fn table_header(&mut self, ui: &mut egui::Ui, columns: &[crate::model::ColumnState]) {
+        let mut drop_target: Option<usize> = None;
+        ui.horizontal(|ui| {
+            for (i, col) in columns.iter().enumerate() {
+                let (rect, response) = ui.allocate_exact_size(
+                    Vec2::new(COL_WIDTH, 24.0),
+                    Sense::click_and_drag(),
+                );
+                let painter = ui.painter_at(rect);
+                let bg = if Some(i) == self.drag_col {
+                    Color32::from_rgba_unmultiplied(0, 100, 200, 60)
+                } else {
+                    Color32::from_gray(225)
+                };
+                painter.rect_filled(rect, 3.0, bg);
+                if self.drag_col.is_some() && response.hovered() && self.drag_col != Some(i) {
+                    drop_target = Some(i);
+                }
+                let has_filter = self.table.filters.contains_key(&col.original);
+                let title = format!(
+                    "{}{}",
+                    col.display,
+                    if has_filter { " ⏷" } else { "" }
+                );
+                painter.text(
+                    rect.min + Vec2::new(6.0, rect.height() / 2.0),
+                    egui::Align2::LEFT_CENTER,
+                    shorten(&title, 20),
+                    egui::FontId::proportional(egui::TextStyle::Button.resolve(ui.style()).size),
+                    ui.visuals().text_color(),
+                );
+
+                // Column header context menu: rename / delete / filter.
+                response.context_menu(|ui| {
+                    if ui.button("Rename column…").clicked() {
+                        self.rename_edit = Some((col.original.clone(), col.display.clone()));
+                        ui.close_menu();
+                    }
+                    if has_filter {
+                        if ui.button("Remove filter").clicked() {
+                            self.table.filters.remove(&col.original);
+                            ui.close_menu();
+                        }
+                    }
+                    if ui.button("Filter…").clicked() {
+                        let current = self
+                            .table
+                            .filters
+                            .get(&col.original)
+                            .cloned()
+                            .unwrap_or(FilterKind::Contains(String::new()));
+                        self.filter_edit = Some((col.original.clone(), current));
+                        ui.close_menu();
+                    }
+                    if ui.button("Delete column").clicked() {
+                        if self.table.delete_column(&col.original) {
+                            self.status = format!("Deleted column '{}' (Undo available).", col.display);
+                        }
+                        ui.close_menu();
+                    }
+                });
+
+                // Drag-to-reorder.
+                if response.dragged() {
+                    self.drag_col = Some(i);
+                }
+            }
+        });
+        // Commit reorder on pointer release.
+        let just_released = ui.input(|i| i.pointer.any_released());
+        if let (Some(from), Some(to)) = (self.drag_col, drop_target) {
+            if just_released {
+                // Map visible (active) indices to full-list indices.
+                let from_full = self.table.full_index(from);
+                let to_full = self.table.full_index(to);
+                self.table.move_column(from_full, to_full);
+                self.drag_col = None;
+            }
+        } else if !ui.input(|i| i.pointer.any_down()) {
+            self.drag_col = None;
+        }
+    }
+
+    /// Rename and filter dialogs (small popup windows over the table).
+    fn focus_dialogs(&mut self, ui: &mut egui::Ui) {
+        // Rename dialog
+        if self.rename_edit.is_some() {
+            let (original, mut buffer) = self.rename_edit.clone().unwrap();
+            let mut open = true;
+            let mut apply = false;
+            let mut cancel = false;
+            egui::Window::new("Rename column")
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut open)
+                .show(ui.ctx(), |ui| {
+                    ui.label("New column name (written back as the property key on export):");
+                    ui.text_edit_singleline(&mut buffer);
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply").clicked() {
+                            apply = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if apply {
+                self.table.rename_column(&original, &buffer);
+                self.status = format!("Renamed '{original}' to '{buffer}'.");
+                self.rename_edit = None;
+            } else if cancel || !open {
+                self.rename_edit = None;
+            }
+        }
+
+        // Filter dialog
+        if self.filter_edit.is_some() {
+            let (original, mut filter) = self.filter_edit.clone().unwrap();
+            let mut open = true;
+            let mut cancel = false;
+            let mut outcome: Option<bool> = None; // Some(true)=apply, Some(false)=remove
+            egui::Window::new(format!("Filter: {original}"))
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut open)
+                .show(ui.ctx(), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Mode:");
+                        let cur = match &filter {
+                            FilterKind::Contains(s) | FilterKind::Equals(s) => s.clone(),
+                            _ => String::new(),
+                        };
+                        if ui
+                            .selectable_value(&mut filter, FilterKind::Contains(cur.clone()), "contains")
+                            .changed()
+                        {}
+                        if ui.selectable_value(&mut filter, FilterKind::Equals(cur), "equals").changed() {}
+                        if ui
+                            .selectable_value(
+                                &mut filter,
+                                FilterKind::Range { min: 0.0, max: 1.0 },
+                                "numeric range",
+                            )
+                            .changed()
+                        {}
+                    });
+                    ui.add_space(4.0);
+                    match &mut filter {
+                        FilterKind::Contains(s) | FilterKind::Equals(s) => {
+                            ui.text_edit_singleline(s);
+                        }
+                        FilterKind::Range { min, max } => {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::DragValue::new(min).speed(0.1));
+                                ui.label("min … max");
+                                ui.add(egui::DragValue::new(max).speed(0.1));
+                            });
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply").clicked() {
+                            outcome = Some(true);
+                        }
+                        if ui.button("Remove filter").clicked() {
+                            outcome = Some(false);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            match outcome {
+                Some(true) => {
+                    let keep = !matches!(&filter, FilterKind::Contains(s) | FilterKind::Equals(s) if s.is_empty());
+                    if keep {
+                        self.table.filters.insert(original.clone(), filter);
+                    } else {
+                        self.table.filters.remove(&original);
+                    }
+                    self.filter_edit = None;
+                }
+                Some(false) => {
+                    self.table.filters.remove(&original);
+                    self.filter_edit = None;
+                }
+                None => {
+                    if !open || cancel {
+                        self.filter_edit = None;
+                    } else {
+                        // keep live-edited state so Apply works after edits
+                        self.filter_edit = Some((original, filter));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Export the edited (and optionally filtered) data as GeoJSON.
+    fn export_geojson(&mut self) {
+        let Some((name, ds)) = &self.dataset else {
+            self.status = "Open a GeoJSON file first.".into();
+            return;
+        };
+        let stem = name.trim_end_matches(".geojson").trim_end_matches(".json");
+        let default_name = format!("{stem}_edited.geojson");
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export edited GeoJSON")
+            .add_filter("GeoJSON", &["geojson"])
+            .set_file_name(&default_name)
+            .set_directory(
+                self.settings
+                    .last_dir
+                    .clone()
+                    .unwrap_or_else(|| ".".into()),
+            )
+            .save_file()
+        else {
+            return;
+        };
+        let json = export_geojson(&ds.features, &self.table, self.respect_filters_on_export);
+        match std::fs::write(&path, json) {
+            Ok(_) => self.status = format!("Exported {}.", path.display()),
+            Err(e) => self.status = format!("Export failed: {e}"),
+        }
     }
 
     fn renderer_controls(&mut self, ui: &mut egui::Ui) {
@@ -392,6 +778,10 @@ impl GeoJsonToolkitApp {
                 )
                 .clicked()
             {}
+            if ui
+                .selectable_value(&mut self.style.renderer, RendererKind::Graduated, "Graduated")
+                .clicked()
+            {}
             ui.separator();
             ui.label("Geometry:");
             let kinds = self
@@ -406,6 +796,9 @@ impl GeoJsonToolkitApp {
                 {}
             }
         });
+        if self.style.renderer == RendererKind::Graduated {
+            self.graduated_controls(ui);
+        }
         if self.style.renderer == RendererKind::Categorized {
             ui.horizontal(|ui| {
                 ui.label("Attribute:");
@@ -441,6 +834,145 @@ impl GeoJsonToolkitApp {
                     }
                 }
             });
+        }
+    }
+
+    /// Phase 3: graduated (class-break) renderer controls.
+    fn graduated_controls(&mut self, ui: &mut egui::Ui) {
+        let numeric_fields: Vec<(String, Vec<f64>)> = self
+            .dataset
+            .as_ref()
+            .map(|(_, ds)| {
+                ds.fields
+                    .iter()
+                    .filter(|f| f.num_min.is_some())
+                    .map(|f| {
+                        let values: Vec<f64> = ds
+                            .features
+                            .iter()
+                            .filter_map(|feat| {
+                                feat.get(&f.name)
+                                    .and_then(|v| v.as_f64())
+                                    .filter(|n| n.is_finite())
+                            })
+                            .collect();
+                        (f.name.clone(), values)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        ui.horizontal(|ui| {
+            ui.label("Numeric attribute:");
+            let selected = self.style.graduated.attr.clone();
+            egui::ComboBox::from_id_source("grad_attr_combo")
+                .selected_text(if selected.is_empty() {
+                    "– pick –".to_string()
+                } else {
+                    selected.clone()
+                })
+                .show_ui(ui, |ui| {
+                    for (name, values) in &numeric_fields {
+                        if ui.selectable_value(&mut self.style.graduated.attr, name.clone(), name).clicked() {
+                            self.style.build_breaks(values);
+                            self.status = format!(
+                                "Built {} class breaks from '{name}'.",
+                                self.style.graduated.n_classes
+                            );
+                        }
+                    }
+                });
+            if ui
+                .selectable_value(
+                    &mut self.style.graduated.method,
+                    ClassificationMethod::EqualInterval,
+                    "Equal interval",
+                )
+                .changed()
+            {
+                self.rebuild_graduated(&numeric_fields);
+            }
+            if ui
+                .selectable_value(
+                    &mut self.style.graduated.method,
+                    ClassificationMethod::Quantile,
+                    "Quantile",
+                )
+                .changed()
+            {
+                self.rebuild_graduated(&numeric_fields);
+            }
+            let mut n = self.style.graduated.n_classes;
+            if ui
+                .add(egui::Slider::new(&mut n, 2..=10).text("classes"))
+                .changed()
+            {
+                self.style.graduated.n_classes = n;
+                self.rebuild_graduated(&numeric_fields);
+            }
+            let mut low = to_color32(self.style.graduated.ramp_low);
+            ui.label("Ramp:");
+            if egui::color_picker::color_edit_button_srgba(
+                ui,
+                &mut low,
+                egui::color_picker::Alpha::OnlyBlend,
+            )
+            .changed()
+            {
+                self.style.graduated.ramp_low = from_color32(low);
+                self.rebuild_graduated(&numeric_fields);
+            }
+            let mut high = to_color32(self.style.graduated.ramp_high);
+            if egui::color_picker::color_edit_button_srgba(
+                ui,
+                &mut high,
+                egui::color_picker::Alpha::OnlyBlend,
+            )
+            .changed()
+            {
+                self.style.graduated.ramp_high = from_color32(high);
+                self.rebuild_graduated(&numeric_fields);
+            }
+            if ui.button("Rebuild breaks").clicked() {
+                self.rebuild_graduated(&numeric_fields);
+            }
+        });
+        if !self.style.graduated.breaks.is_empty() {
+            ui.label(format!(
+                "{} class break(s) on '{}':",
+                self.style.graduated.breaks.len(),
+                self.style.graduated.attr
+            ));
+            egui::Grid::new("breaks")
+                .striped(true)
+                .num_columns(2)
+                .show(ui, |ui| {
+                    for b in &self.style.graduated.breaks {
+                        let swatch = egui::Color32::from_rgba_unmultiplied(
+                            b.fill.color.r,
+                            b.fill.color.g,
+                            b.fill.color.b,
+                            255,
+                        );
+                        let (rect, _) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
+                        ui.painter_at(rect).rect_filled(rect, 2.0, swatch);
+                        ui.label(format!("{:.4} – {:.4}", b.lower, b.upper));
+                        ui.end_row();
+                    }
+                });
+        }
+    }
+
+    fn rebuild_graduated(&mut self, numeric_fields: &[(String, Vec<f64>)]) {
+        let attr = self.style.graduated.attr.clone();
+        if let Some((_, values)) = numeric_fields.iter().find(|(n, _)| *n == attr) {
+            self.style.build_breaks(values);
+        }
+        if let Some((name, values)) = numeric_fields.first() {
+            if self.style.graduated.attr.is_empty() || self.style.graduated.breaks.is_empty() {
+                self.style.graduated.attr = name.clone();
+                self.style.build_breaks(values);
+            }
         }
     }
 

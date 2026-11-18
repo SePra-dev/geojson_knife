@@ -68,7 +68,21 @@ QGIS shows a single `SimpleMarker` layer; no warnings.
 - Category labels appear in the layer legend.
 - No warnings.
 
-## Test 5 — attribute names with spaces
+## Test 5 — graduated (class-break) renderer
+
+1. Open `samples/polygons.geojson` (numeric attribute `area`).
+2. Renderer → **Graduated**; attribute → `area`; method → *Equal interval*,
+   classes → 3; set ramp colors (light → dark).
+3. Export `polygons_graduated.qml` and load it in QGIS.
+
+**Expected:**
+- QGIS shows a *Graduated* renderer with 3 ranges (`lower`/`upper` labels) and
+  one symbol per class, colors interpolated between the ramp stops.
+- Each polygon is colored by which `area` class-break it falls into; the first
+  and last polygons should clearly differ in color.
+- No warnings.
+
+## Test 6 — attribute names with spaces
 
 1. Open any sample, rename... (Phase 1 note: pick a file whose attribute name
    contains a space, or create one) and export a categorized style for it.
@@ -76,7 +90,7 @@ QGIS shows a single `SimpleMarker` layer; no warnings.
 **Expected:** the `.qml` contains the attribute as `"my attr"` (quoted inside
 `attr="…"`), and QGIS resolves it correctly.
 
-## Test 6 — robustness
+## Test 7 — robustness
 
 1. Drag `samples/malformed.geojson` onto the app window.
 
@@ -89,7 +103,7 @@ running; previously loaded data stays usable.
 file info shows 60,000 features and attributes id/kind/score with correct
 types (number/text/number).
 
-## Test 7 — style project round-trip
+## Test 8 — style project round-trip
 
 1. Design any style, click **Save style** → `my_style.json`.
 2. Restart the app, click **Load style** → `my_style.json`.

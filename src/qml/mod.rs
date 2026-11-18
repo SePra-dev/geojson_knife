@@ -124,29 +124,47 @@ fn simple_marker(p: &PointSymbol) -> String {
     xml
 }
 
-fn symbol_xml(name: &str, kind: GeometryKind, style: &StyleProject, cat: Option<&Category>) -> String {
+fn symbol_from_parts(
+    name: &str,
+    kind: GeometryKind,
+    fill: &Fill,
+    line: &LineSymbol,
+    point: &PointSymbol,
+) -> String {
     let (sym_type, body) = match kind.symbol_family() {
-        "fill" => {
-            let f = cat.map(|c| &c.fill).unwrap_or(&style.fill);
-            ("fill", simple_fill(f))
-        }
-        "line" => {
-            let l = cat.map(|c| &c.line).unwrap_or(&style.line);
-            ("line", simple_line(l))
-        }
-        _ => {
-            let p = cat.map(|c| &c.point).unwrap_or(&style.point);
-            ("marker", simple_marker(p))
-        }
+        "fill" => ("fill", simple_fill(fill)),
+        "line" => ("line", simple_line(line)),
+        _ => ("marker", simple_marker(point)),
     };
     format!(
         "    <symbol type=\"{sym_type}\" name=\"{name}\" force_raster=\"0\" alpha=\"1\" is_animated=\"0\" frame_rate=\"10\" clip_to_extent=\"0\">\n{body}    </symbol>\n"
     )
 }
 
+fn symbol_xml(name: &str, kind: GeometryKind, style: &StyleProject, cat: Option<&Category>) -> String {
+    let (fill, line, point) = match cat {
+        Some(c) => (&c.fill, &c.line, &c.point),
+        None => (&style.fill, &style.line, &style.point),
+    };
+    symbol_from_parts(name, kind, fill, line, point)
+}
+
 /// QGIS quotes the attribute name inside `attr="..."` so that names with spaces work.
 fn attr_expression(attr: &str) -> String {
     format!("\"{attr}\"")
+}
+
+/// Range label the way QGIS writes it, e.g. "20.0000 – 40.0000".
+fn break_label(b: &crate::model::ClassBreak) -> String {
+    format!("{:.4} – {:.4}", b.lower, b.upper)
+}
+
+fn fmt_f64(v: f64) -> String {
+    if v.fract().abs() < f64::EPSILON && v.abs() < 1e15 {
+        format!("{v}")
+    } else {
+        format!("{v:.6}")
+    }
 }
 
 /// Generate a complete QGIS 3.x `.qml` style file for the given style project and
@@ -163,6 +181,37 @@ pub fn generate_qml(style: &StyleProject, kind: GeometryKind) -> String {
             xml.push_str("  <renderer-v2 type=\"singleSymbol\" symbol=\"0\" enableorderby=\"0\" forceraster=\"0\">\n");
             xml.push_str("    <symbols>\n");
             xml.push_str(&symbol_xml("0", kind, style, None));
+            xml.push_str("    </symbols>\n");
+            xml.push_str("  </renderer-v2>\n");
+        }
+        RendererKind::Graduated => {
+            let attr = &style.graduated.attr;
+            xml.push_str(&format!(
+                "  <renderer-v2 attr=\"{}\" type=\"graduatedSymbol\" symbol=\"0\" graduatedMethod=\"GraduatedColor\" enableorderby=\"0\" forceraster=\"0\">\n",
+                esc(&attr_expression(attr))
+            ));
+            xml.push_str("    <ranges>\n");
+            for (i, b) in style.graduated.breaks.iter().enumerate() {
+                xml.push_str(&format!(
+                    "      <range render=\"{}\" symbol=\"{}\" label=\"{}\" lower=\"{}\" upper=\"{}\"/>\n",
+                    if b.render { "true" } else { "false" },
+                    i,
+                    esc(&break_label(b)),
+                    fmt_f64(b.lower),
+                    fmt_f64(b.upper)
+                ));
+            }
+            xml.push_str("    </ranges>\n");
+            xml.push_str("    <symbols>\n");
+            for (i, b) in style.graduated.breaks.iter().enumerate() {
+                xml.push_str(&symbol_from_parts(
+                    &i.to_string(),
+                    kind,
+                    &b.fill,
+                    &b.line,
+                    &b.point,
+                ));
+            }
             xml.push_str("    </symbols>\n");
             xml.push_str("  </renderer-v2>\n");
         }
@@ -200,7 +249,7 @@ pub fn generate_qml(style: &StyleProject, kind: GeometryKind) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Fill, Hatch, Outline};
+    use crate::model::{ClassificationMethod, Fill, Hatch, Outline};
 
     fn base_style() -> StyleProject {
         StyleProject::default()
@@ -310,6 +359,43 @@ mod tests {
             generate_qml(&cat_style, GeometryKind::Polygon),
         )
         .unwrap();
+        let mut grad_style = StyleProject::default();
+        grad_style.renderer = RendererKind::Graduated;
+        grad_style.graduated.attr = "size".into();
+        grad_style.build_breaks(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        std::fs::write(
+            "tests/golden/graduated_fill.qml",
+            generate_qml(&grad_style, GeometryKind::Polygon),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn graduated_fill_matches_golden_file() {
+        let mut style = base_style();
+        style.renderer = RendererKind::Graduated;
+        style.graduated.attr = "size".into();
+        style.build_breaks(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let xml = generate_qml(&style, GeometryKind::Polygon);
+        let expected = read_golden("graduated_fill.qml");
+        assert_eq!(xml, expected);
+    }
+
+    #[test]
+    fn graduated_renderer_structure() {
+        let mut style = base_style();
+        style.renderer = RendererKind::Graduated;
+        style.graduated.attr = "size".into();
+        style.graduated.method = ClassificationMethod::Quantile;
+        style.build_breaks(&[0.0, 10.0, 20.0, 30.0]);
+        let xml = generate_qml(&style, GeometryKind::Polygon);
+        assert!(xml.contains("type=\"graduatedSymbol\""));
+        assert!(xml.contains("graduatedMethod=\"GraduatedColor\""));
+        assert!(xml.contains("attr=\"&quot;size&quot;\""));
+        assert_eq!(xml.matches("<range ").count(), 5);
+        assert_eq!(xml.matches("</symbol>").count(), 5);
+        assert!(xml.contains("lower=\"0\""));
+        assert!(xml.contains("upper=\"30\""));
     }
 
     #[test]
