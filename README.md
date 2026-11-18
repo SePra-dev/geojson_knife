@@ -139,4 +139,4 @@ so the table editor cannot break the styling/export pipeline.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache License 2.0 — see [LICENSE](LICENSE).

@@ -5,7 +5,7 @@ fn main() {
         res.set_icon("assets/icon.ico");
         res.set("FileDescription", "GeoJSON Toolkit");
         res.set("ProductName", "GeoJSON Toolkit");
-        res.set("LegalCopyright", "MIT License");
+        res.set("LegalCopyright", "Apache License 2.0");
         match res.compile() {
             Ok(_) => println!("cargo:rerun-if-changed=assets/icon.ico"),
             Err(e) => {
