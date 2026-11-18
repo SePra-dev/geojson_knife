@@ -99,13 +99,24 @@ cargo test          # 24 unit tests + golden-file QML snapshot tests
 cargo test -- --ignored regenerate_golden   # regenerate golden files (review diff!)
 ```
 
+- **Graduated (class-break) rendering (Phase 3)**: pick a numeric attribute,
+  choose *Equal interval* or *Quantile* classification with 2–10 classes, and set
+  the two ramp stop colors — class symbols interpolate between them (the base
+  fill/hatch/outline is inherited). Breaks and symbols are listed live and exported
+  as a QGIS `graduatedSymbol` renderer.
+- **Geometry inspection & statistics (Phase 3)**: the file panel shows the dataset
+  bounding box (WGS84), total vertex count, and per-attribute numeric statistics
+  (min/max, sum, mean, standard deviation) alongside distinct values and null counts.
+
 ## Roadmap
 
 - **Phase 2 (done)** — data-table editor: virtualized table, rename/reorder/delete
   columns (with undo), per-column filters, GeoJSON export.
-- **Phase 3** — ideas backlog: graduated (class-break) styles with color ramps,
-  geometry inspection, CRS info, GeoPackage/SHP import, batch conversion,
-  attribute statistics.
+- **Phase 3 (partially done)** — graduated (class-break) styles with color ramps,
+  geometry inspection, CRS info line, attribute statistics: **implemented**.
+  Remaining backlog: GeoPackage/SHP import, batch conversion (deliberately
+  deferred — they would need format libraries that threaten the portable
+  single-EXE constraint).
 
 The architecture keeps Phase 2/3 concerns separated (`model/`, `io/`, `qml/`, `ui/`)
 so the table editor cannot break the styling/export pipeline.

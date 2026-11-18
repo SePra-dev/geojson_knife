@@ -123,6 +123,61 @@ pub struct FieldInfo {
     pub null_count: usize,
     pub num_min: Option<f64>,
     pub num_max: Option<f64>,
+    /// Numeric statistics (None when the attribute has no numeric values).
+    pub num_mean: Option<f64>,
+    pub num_sum: Option<f64>,
+    pub num_stddev: Option<f64>,
+}
+
+/// Dataset bounding box in WGS84 lon/lat (RFC 7946).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bbox {
+    pub min_x: f64,
+    pub min_y: f64,
+    pub max_x: f64,
+    pub max_y: f64,
+}
+
+impl Bbox {
+    pub fn merge(&mut self, x: f64, y: f64) {
+        if !x.is_finite() || !y.is_finite() {
+            return;
+        }
+        self.min_x = self.min_x.min(x);
+        self.min_y = self.min_y.min(y);
+        self.max_x = self.max_x.max(x);
+        self.max_y = self.max_y.max(y);
+    }
+}
+
+/// Visit every coordinate position (`[x, y(, z)]`) inside a GeoJSON geometry
+/// value — either a bare `coordinates` array or a full geometry object
+/// (including nested `GeometryCollection` members). Never panics on malformed input.
+pub fn visit_coordinates(v: &Value, f: &mut impl FnMut(f64, f64)) {
+    match v {
+        Value::Object(obj) => {
+            if let Some(coords) = obj.get("coordinates") {
+                visit_coordinates(coords, f);
+            }
+            if let Some(geoms) = obj.get("geometries").and_then(|g| g.as_array()) {
+                for g in geoms {
+                    visit_coordinates(g, f);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            if !arr.is_empty() && arr.iter().all(|x| x.is_number()) {
+                if let (Some(x), Some(y)) = (arr[0].as_f64(), arr[1].as_f64()) {
+                    f(x, y);
+                }
+            } else {
+                for item in arr {
+                    visit_coordinates(item, f);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +187,34 @@ pub struct Dataset {
     pub fields: Vec<FieldInfo>,
     /// All geometry kinds present (sorted).
     pub geometry_kinds: Vec<GeometryKind>,
+    /// Bounding box over all coordinate positions (None if there are none).
+    pub extent: Option<Bbox>,
+    /// Total number of coordinate positions across all geometries.
+    pub vertex_count: usize,
+}
+
+fn compute_extent(features: &[Feature]) -> (Option<Bbox>, usize) {
+    let mut bbox = Bbox {
+        min_x: f64::INFINITY,
+        min_y: f64::INFINITY,
+        max_x: f64::NEG_INFINITY,
+        max_y: f64::NEG_INFINITY,
+    };
+    let mut n = 0usize;
+    for f in features {
+        visit_coordinates(&f.geometry, &mut |x, y| {
+            bbox.merge(x, y);
+            n += 1;
+        });
+    }
+    (
+        if n > 0 {
+            Some(bbox)
+        } else {
+            None
+        },
+        n,
+    )
 }
 
 impl Dataset {
@@ -168,6 +251,9 @@ impl Dataset {
                 let mut null_count = 0usize;
                 let mut num_min = f64::INFINITY;
                 let mut num_max = f64::NEG_INFINITY;
+                let mut num_sum = 0.0f64;
+                let mut num_count = 0usize;
+                let mut num_sumsq = 0.0f64;
 
                 for f in features {
                     let v = match f.get(&name) {
@@ -189,8 +275,13 @@ impl Dataset {
                     });
                     if let Value::Number(n) = v {
                         if let Some(fv) = n.as_f64() {
-                            num_min = num_min.min(fv);
-                            num_max = num_max.max(fv);
+                            if fv.is_finite() {
+                                num_min = num_min.min(fv);
+                                num_max = num_max.max(fv);
+                                num_sum += fv;
+                                num_sumsq += fv * fv;
+                                num_count += 1;
+                            }
                         }
                     }
                     let key = value_to_string(v);
@@ -210,6 +301,15 @@ impl Dataset {
                     null_count,
                     num_min: if num_min.is_finite() { Some(num_min) } else { None },
                     num_max: if num_max.is_finite() { Some(num_max) } else { None },
+                    num_mean: if num_count > 0 { Some(num_sum / num_count as f64) } else { None },
+                    num_sum: if num_count > 0 { Some(num_sum) } else { None },
+                    num_stddev: if num_count > 0 {
+                        let mean = num_sum / num_count as f64;
+                        let var = (num_sumsq / num_count as f64) - mean * mean;
+                        Some(var.max(0.0).sqrt())
+                    } else {
+                        None
+                    },
                 }
             })
             .collect()
@@ -303,9 +403,12 @@ pub fn parse_geojson(text: &str) -> Result<Dataset, GeoJsonError> {
         _ => return Err(GeoJsonError::UnsupportedType),
     };
 
+    let (extent, vertex_count) = compute_extent(&features);
     Ok(Dataset {
         geometry_kinds: Dataset::collect_kinds(&features),
         fields: Dataset::analyze_fields(&features),
+        extent,
+        vertex_count,
         features,
     })
 }
@@ -423,5 +526,44 @@ mod tests {
         let data = r#"{"type":"Feature","geometry":null,"properties":{"a":1}}"#;
         let ds = parse_geojson(data).unwrap();
         assert_eq!(ds.features.len(), 1);
+    }
+
+    #[test]
+    fn numeric_statistics_are_computed() {
+        let data = r#"{"type":"FeatureCollection","features":[
+            {"type":"Feature","geometry":{"type":"Point","coordinates":[0,0]},"properties":{"v":2}},
+            {"type":"Feature","geometry":{"type":"Point","coordinates":[0,0]},"properties":{"v":4}},
+            {"type":"Feature","geometry":{"type":"Point","coordinates":[0,0]},"properties":{"v":6}}
+        ]}"#;
+        let ds = parse_geojson(data).unwrap();
+        let v = &ds.fields[0];
+        assert_eq!(v.num_mean, Some(4.0));
+        assert_eq!(v.num_sum, Some(12.0));
+        assert!((v.num_stddev.unwrap() - (8.0f64 / 3.0).sqrt()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn extent_and_vertex_count_across_geometry_types() {
+        let data = r#"{"type":"FeatureCollection","features":[
+            {"type":"Feature","geometry":{"type":"Polygon","coordinates":[[[0,0],[10,0],[10,10],[0,10],[0,0]]]},"properties":{}},
+            {"type":"Feature","geometry":{"type":"LineString","coordinates":[[-5,2],[3,7]]},"properties":{}},
+            {"type":"Feature","geometry":{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[1,20]}]},"properties":{}}
+        ]}"#;
+        let ds = parse_geojson(data).unwrap();
+        // 5 polygon vertices + 2 line + 1 point (inside the GeometryCollection)
+        let bbox = ds.extent.expect("bbox");
+        assert_eq!((bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y), (-5.0, 0.0, 10.0, 20.0));
+        // 5 polygon vertices + 2 line + 1 point
+        assert_eq!(ds.vertex_count, 8);
+    }
+
+    #[test]
+    fn visit_coordinates_ignores_non_positions() {
+        let mut count = 0;
+        visit_coordinates(&serde_json::json!([[1, 2], [3, "x"]]), &mut |_, _| count += 1);
+        assert_eq!(count, 1);
+        let mut count = 0;
+        visit_coordinates(&serde_json::json!("nope"), &mut |_, _| count += 1);
+        assert_eq!(count, 0);
     }
 }

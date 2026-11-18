@@ -8,5 +8,6 @@ pub use geo::{parse_geojson, AttrType, Dataset, Feature, FieldInfo, GeoJsonError
 pub use table::{export_geojson, ColumnState, FilterKind, TableState};
 #[allow(unused_imports)]
 pub use style::{
-    Category, Color, Fill, Hatch, LineSymbol, Outline, PointSymbol, RendererKind, StyleProject,
+    Category, ClassBreak, ClassificationMethod, Color, Fill, GraduatedConfig, Hatch, LineSymbol,
+    Outline, PointSymbol, RendererKind, StyleProject,
 };

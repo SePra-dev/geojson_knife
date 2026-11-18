@@ -5,7 +5,9 @@ use crate::io::{AppSettings, LoadHandle, LoadResult};
 use crate::model::{Dataset, GeometryKind, StyleProject, TableState};
 use crate::model::{export_geojson, FilterKind};
 use crate::model::geo::value_to_string;
-use crate::model::{Category, Color, Fill, Hatch, LineSymbol, PointSymbol, RendererKind};
+use crate::model::{
+    Category, ClassificationMethod, Color, Fill, Hatch, LineSymbol, PointSymbol, RendererKind,
+};
 use crate::qml;
 use eframe::egui;
 use egui::{Align2, Color32, Pos2, Sense, Vec2};
@@ -303,7 +305,14 @@ impl GeoJsonToolkitApp {
                     .map(|k| k.label())
                     .collect();
                 ui.label(format!("Geometry: {}", kinds.join(", ")));
-                ui.label("CRS: WGS84 (RFC 7946)");
+                ui.label("CRS: WGS84 (RFC 7946, longitude/latitude)");
+                ui.label(format!("Vertices: {}", ds.vertex_count));
+                if let Some(bbox) = ds.extent {
+                    ui.label(format!(
+                        "Extent: [{:.5}, {:.5}] – [{:.5}, {:.5}]",
+                        bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y
+                    ));
+                }
             }
             None => {
                 ui.label("No file loaded.");
@@ -352,7 +361,14 @@ impl GeoJsonToolkitApp {
                     ui.label(f.ty.label());
                     match (f.ty, f.num_min, f.num_max) {
                         (crate::model::AttrType::Number, Some(min), Some(max)) => {
-                            ui.label(format!("min {min}, max {max}"));
+                            let stats = match (f.num_mean, f.num_stddev) {
+                                (Some(mean), Some(stddev)) => format!(
+                                    "min {min}, max {max}, Σ {:.0}, mean {mean:.2}, σ {stddev:.2}",
+                                    f.num_sum.unwrap_or_default()
+                                ),
+                                _ => format!("min {min}, max {max}"),
+                            };
+                            ui.label(shorten(&stats, 60));
                         }
                         _ => {
                             let preview = if f.distinct.len() < f.distinct_count {
@@ -762,6 +778,10 @@ impl GeoJsonToolkitApp {
                 )
                 .clicked()
             {}
+            if ui
+                .selectable_value(&mut self.style.renderer, RendererKind::Graduated, "Graduated")
+                .clicked()
+            {}
             ui.separator();
             ui.label("Geometry:");
             let kinds = self
@@ -776,6 +796,9 @@ impl GeoJsonToolkitApp {
                 {}
             }
         });
+        if self.style.renderer == RendererKind::Graduated {
+            self.graduated_controls(ui);
+        }
         if self.style.renderer == RendererKind::Categorized {
             ui.horizontal(|ui| {
                 ui.label("Attribute:");
@@ -811,6 +834,145 @@ impl GeoJsonToolkitApp {
                     }
                 }
             });
+        }
+    }
+
+    /// Phase 3: graduated (class-break) renderer controls.
+    fn graduated_controls(&mut self, ui: &mut egui::Ui) {
+        let numeric_fields: Vec<(String, Vec<f64>)> = self
+            .dataset
+            .as_ref()
+            .map(|(_, ds)| {
+                ds.fields
+                    .iter()
+                    .filter(|f| f.num_min.is_some())
+                    .map(|f| {
+                        let values: Vec<f64> = ds
+                            .features
+                            .iter()
+                            .filter_map(|feat| {
+                                feat.get(&f.name)
+                                    .and_then(|v| v.as_f64())
+                                    .filter(|n| n.is_finite())
+                            })
+                            .collect();
+                        (f.name.clone(), values)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        ui.horizontal(|ui| {
+            ui.label("Numeric attribute:");
+            let selected = self.style.graduated.attr.clone();
+            egui::ComboBox::from_id_source("grad_attr_combo")
+                .selected_text(if selected.is_empty() {
+                    "– pick –".to_string()
+                } else {
+                    selected.clone()
+                })
+                .show_ui(ui, |ui| {
+                    for (name, values) in &numeric_fields {
+                        if ui.selectable_value(&mut self.style.graduated.attr, name.clone(), name).clicked() {
+                            self.style.build_breaks(values);
+                            self.status = format!(
+                                "Built {} class breaks from '{name}'.",
+                                self.style.graduated.n_classes
+                            );
+                        }
+                    }
+                });
+            if ui
+                .selectable_value(
+                    &mut self.style.graduated.method,
+                    ClassificationMethod::EqualInterval,
+                    "Equal interval",
+                )
+                .changed()
+            {
+                self.rebuild_graduated(&numeric_fields);
+            }
+            if ui
+                .selectable_value(
+                    &mut self.style.graduated.method,
+                    ClassificationMethod::Quantile,
+                    "Quantile",
+                )
+                .changed()
+            {
+                self.rebuild_graduated(&numeric_fields);
+            }
+            let mut n = self.style.graduated.n_classes;
+            if ui
+                .add(egui::Slider::new(&mut n, 2..=10).text("classes"))
+                .changed()
+            {
+                self.style.graduated.n_classes = n;
+                self.rebuild_graduated(&numeric_fields);
+            }
+            let mut low = to_color32(self.style.graduated.ramp_low);
+            ui.label("Ramp:");
+            if egui::color_picker::color_edit_button_srgba(
+                ui,
+                &mut low,
+                egui::color_picker::Alpha::OnlyBlend,
+            )
+            .changed()
+            {
+                self.style.graduated.ramp_low = from_color32(low);
+                self.rebuild_graduated(&numeric_fields);
+            }
+            let mut high = to_color32(self.style.graduated.ramp_high);
+            if egui::color_picker::color_edit_button_srgba(
+                ui,
+                &mut high,
+                egui::color_picker::Alpha::OnlyBlend,
+            )
+            .changed()
+            {
+                self.style.graduated.ramp_high = from_color32(high);
+                self.rebuild_graduated(&numeric_fields);
+            }
+            if ui.button("Rebuild breaks").clicked() {
+                self.rebuild_graduated(&numeric_fields);
+            }
+        });
+        if !self.style.graduated.breaks.is_empty() {
+            ui.label(format!(
+                "{} class break(s) on '{}':",
+                self.style.graduated.breaks.len(),
+                self.style.graduated.attr
+            ));
+            egui::Grid::new("breaks")
+                .striped(true)
+                .num_columns(2)
+                .show(ui, |ui| {
+                    for b in &self.style.graduated.breaks {
+                        let swatch = egui::Color32::from_rgba_unmultiplied(
+                            b.fill.color.r,
+                            b.fill.color.g,
+                            b.fill.color.b,
+                            255,
+                        );
+                        let (rect, _) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
+                        ui.painter_at(rect).rect_filled(rect, 2.0, swatch);
+                        ui.label(format!("{:.4} – {:.4}", b.lower, b.upper));
+                        ui.end_row();
+                    }
+                });
+        }
+    }
+
+    fn rebuild_graduated(&mut self, numeric_fields: &[(String, Vec<f64>)]) {
+        let attr = self.style.graduated.attr.clone();
+        if let Some((_, values)) = numeric_fields.iter().find(|(n, _)| *n == attr) {
+            self.style.build_breaks(values);
+        }
+        if let Some((name, values)) = numeric_fields.first() {
+            if self.style.graduated.attr.is_empty() || self.style.graduated.breaks.is_empty() {
+                self.style.graduated.attr = name.clone();
+                self.style.build_breaks(values);
+            }
         }
     }
 
