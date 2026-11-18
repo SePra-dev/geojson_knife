@@ -183,6 +183,8 @@ pub fn visit_coordinates(v: &Value, f: &mut impl FnMut(f64, f64)) {
 #[derive(Debug, Clone)]
 pub struct Dataset {
     pub features: Vec<Feature>,
+    /// Coordinate reference system of the geometries as loaded/transformed.
+    pub crs: crate::model::proj::Crs,
     /// Field list in the order found in the first feature that has properties.
     pub fields: Vec<FieldInfo>,
     /// All geometry kinds present (sorted).
@@ -193,7 +195,9 @@ pub struct Dataset {
     pub vertex_count: usize,
 }
 
-fn compute_extent(features: &[Feature]) -> (Option<Bbox>, usize) {
+/// Recompute bounding box and vertex count for a (possibly transformed)
+/// feature set. Public so the UI can refresh after a CRS transformation.
+pub fn compute_extent(features: &[Feature]) -> (Option<Bbox>, usize) {
     let mut bbox = Bbox {
         min_x: f64::INFINITY,
         min_y: f64::INFINITY,
@@ -405,6 +409,7 @@ pub fn parse_geojson(text: &str) -> Result<Dataset, GeoJsonError> {
 
     let (extent, vertex_count) = compute_extent(&features);
     Ok(Dataset {
+        crs: crate::model::proj::Crs::Wgs84,
         geometry_kinds: Dataset::collect_kinds(&features),
         fields: Dataset::analyze_fields(&features),
         extent,

@@ -105,8 +105,24 @@ cargo test -- --ignored regenerate_golden   # regenerate golden files (review di
   fill/hatch/outline is inherited). Breaks and symbols are listed live and exported
   as a QGIS `graduatedSymbol` renderer.
 - **Geometry inspection & statistics (Phase 3)**: the file panel shows the dataset
-  bounding box (WGS84), total vertex count, and per-attribute numeric statistics
+  bounding box, total vertex count, and per-attribute numeric statistics
   (min/max, sum, mean, standard deviation) alongside distinct values and null counts.
+- **Coordinate transformation (WGS84 ↔ ETRS89 UTM 33N ↔ Soldner Berlin)**:
+  transform every geometry in the loaded dataset with one click —
+  - WGS84 lon/lat (EPSG:4326) ↔ ETRS89 / UTM zone 33N (EPSG:25833): pure math
+    (UTM series after Snyder/Krüger, mm–cm accurate). The sub-meter
+    ETRS89↔WGS84 datum difference is treated as zero (common practice).
+  - WGS84 ↔ DHDN / Soldner Berlin (EPSG:3068): Cassini-Soldner projection on
+    Bessel 1841 with the official Berlin parameters (central point Rauenberg,
+    false easting/northing 40 000/10 000 m), **including a real datum shift**
+    DHDN↔WGS84 via the 7-parameter Helmert transformation (EPSG:1777,
+    ~1 m accuracy; sub-centimetre would require the NTv2 BeTA grid). Round
+    trips close to ~1 cm (2D chains cannot carry the ~40 m ellipsoid-height
+    misclosure the datum shift induces — same behaviour as PROJ for 2D input).
+  No PROJ dependency — the single-EXE portability is untouched. The current
+  CRS (including EPSG code) and units-aware extent are shown, transformed data
+  exports like any edited dataset, and warnings appear when data lies outside
+  the 12°E–18°E UTM zone or the Berlin Soldner area of use.
 
 ## Roadmap
 

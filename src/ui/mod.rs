@@ -2,7 +2,13 @@
 //! categorized rendering controls, and export.
 
 use crate::io::{AppSettings, LoadHandle, LoadResult};
-use crate::model::{Dataset, GeometryKind, StyleProject, TableState};
+use crate::model::{
+    compute_extent, Crs, Dataset, GeometryKind, StyleProject, TableState, TransformDirection,
+};
+use crate::model::proj::{
+    soldner_berlin_to_wgs84, transform_geometry, utm33n_to_wgs84, wgs84_to_soldner_berlin,
+    wgs84_to_utm33n, lonlat_in_soldner_area,
+};
 use crate::model::{export_geojson, FilterKind};
 use crate::model::geo::value_to_string;
 use crate::model::{
@@ -295,6 +301,7 @@ impl GeoJsonToolkitApp {
 
     fn file_info(&mut self, ui: &mut egui::Ui) {
         ui.heading("File");
+        let mut pending_transform: Option<TransformDirection> = None;
         match &self.dataset {
             Some((name, ds)) => {
                 ui.label(format!("Name: {name}"));
@@ -305,13 +312,85 @@ impl GeoJsonToolkitApp {
                     .map(|k| k.label())
                     .collect();
                 ui.label(format!("Geometry: {}", kinds.join(", ")));
-                ui.label("CRS: WGS84 (RFC 7946, longitude/latitude)");
+                ui.label(format!(
+                    "CRS: {} (EPSG:{})",
+                    ds.crs.label(),
+                    ds.crs.epsg()
+                ));
                 ui.label(format!("Vertices: {}", ds.vertex_count));
                 if let Some(bbox) = ds.extent {
+                    let (x_unit, y_unit) = match ds.crs {
+                        Crs::Wgs84 => ("°", "°"),
+                        _ => ("m", "m"),
+                    };
                     ui.label(format!(
-                        "Extent: [{:.5}, {:.5}] – [{:.5}, {:.5}]",
-                        bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y
+                        "Extent: [{:.5}{}] [{:.5}{}] – [{:.5}{}] [{:.5}{}]",
+                        bbox.min_x, x_unit, bbox.min_y, y_unit, bbox.max_x, x_unit, bbox.max_y, y_unit
                     ));
+                }
+                ui.separator();
+                ui.label("Transform coordinates:");
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            ds.crs == Crs::Wgs84,
+                            egui::Button::new("WGS84 → ETRS89 UTM 33N"),
+                        )
+                        .clicked()
+                    {
+                        pending_transform = Some(TransformDirection::Wgs84ToUtm33n);
+                    }
+                    if ui
+                        .add_enabled(
+                            ds.crs == Crs::Etrs89Utm33n,
+                            egui::Button::new("ETRS89 UTM 33N → WGS84"),
+                        )
+                        .clicked()
+                    {
+                        pending_transform = Some(TransformDirection::Utm33nToWgs84);
+                    }
+                    if ui
+                        .add_enabled(
+                            ds.crs == Crs::Wgs84,
+                            egui::Button::new("WGS84 → Soldner Berlin (3068)"),
+                        )
+                        .clicked()
+                    {
+                        pending_transform = Some(TransformDirection::Wgs84ToSoldnerBerlin);
+                    }
+                    if ui
+                        .add_enabled(
+                            ds.crs == Crs::SoldnerBerlin,
+                            egui::Button::new("Soldner Berlin → WGS84"),
+                        )
+                        .clicked()
+                    {
+                        pending_transform = Some(TransformDirection::SoldnerBerlinToWgs84);
+                    }
+                });
+                // Soldner-Berlin area-of-use hint (only meaningful from WGS84).
+                let mut soldner_hint = false;
+                if ds.crs == Crs::Wgs84 {
+                    if let Some(bbox) = ds.extent {
+                        soldner_hint = !lonlat_in_soldner_area(bbox.min_x, bbox.min_y)
+                            || !lonlat_in_soldner_area(bbox.max_x, bbox.max_y);
+                    }
+                }
+                if soldner_hint {
+                    ui.colored_label(
+                        Color32::from_rgb(180, 100, 0),
+                        "⚠ part of the data lies outside the Berlin Soldner area of use — accuracy degrades there",
+                    );
+                }
+                if let Some(bbox) = ds.extent {
+                    if !(crate::model::proj::lon_in_zone33(bbox.min_x)
+                        && crate::model::proj::lon_in_zone33(bbox.max_x))
+                    {
+                        ui.colored_label(
+                            Color32::from_rgb(180, 100, 0),
+                            "⚠ part of the data lies outside UTM zone 33N (12°E–18°E) — distortion grows there",
+                        );
+                    }
                 }
             }
             None => {
@@ -322,6 +401,9 @@ impl GeoJsonToolkitApp {
                 }
                 ui.label("Drag & drop a .geojson file onto this window.");
             }
+        }
+        if let Some(dir) = pending_transform {
+            self.transform_dataset(dir);
         }
     }
 
@@ -429,6 +511,49 @@ impl GeoJsonToolkitApp {
                 self.category_designer(ui);
             }
         });
+    }
+
+    /// Transform all feature geometries between WGS84 and ETRS89 UTM 33N.
+    /// Atomic: on any coordinate error, nothing is changed and the user gets
+    /// a friendly message.
+    fn transform_dataset(&mut self, direction: TransformDirection) {
+        let Some((_, ds)) = &mut self.dataset else { return; };
+        let (target_crs, project): (Crs, &dyn Fn(f64, f64) -> Result<(f64, f64), _>) = match direction {
+            TransformDirection::Wgs84ToUtm33n => (Crs::Etrs89Utm33n, &wgs84_to_utm33n),
+            TransformDirection::Utm33nToWgs84 => (Crs::Wgs84, &utm33n_to_wgs84),
+            TransformDirection::Wgs84ToSoldnerBerlin => {
+                (Crs::SoldnerBerlin, &wgs84_to_soldner_berlin)
+            }
+            TransformDirection::SoldnerBerlinToWgs84 => {
+                (Crs::Wgs84, &soldner_berlin_to_wgs84)
+            }
+        };
+        // Transform first, collect into a new vec; swap on success only.
+        let mut transformed = Vec::with_capacity(ds.features.len());
+        for f in &ds.features {
+            match transform_geometry(&f.geometry, project) {
+                Ok(g) => transformed.push(crate::model::Feature {
+                    kind: f.kind,
+                    geometry: g,
+                    properties: f.properties.clone(),
+                }),
+                Err(e) => {
+                    self.status = format!("Transformation failed: {e}");
+                    self.file_error = Some(format!("Transformation failed: {e}"));
+                    return;
+                }
+            }
+        }
+        ds.features = transformed;
+        ds.crs = target_crs;
+        let (extent, vertices) = compute_extent(&ds.features);
+        ds.extent = extent;
+        ds.vertex_count = vertices;
+        self.status = format!(
+            "Transformed {} features to {}.",
+            ds.features.len(),
+            target_crs.label()
+        );
     }
 
     // ---------- Phase 2: table editor ----------
