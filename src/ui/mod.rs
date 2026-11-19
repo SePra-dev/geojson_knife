@@ -49,6 +49,43 @@ pub struct GeoJsonToolkitApp {
     /// Index of the column currently dragged in the table header.
     drag_col: Option<usize>,
     respect_filters_on_export: bool,
+    /// Short-lived success/error overlay message.
+    toast: Option<Toast>,
+    /// Row count before the last export (for feedback), plus result kind.
+    _last_feedback: String,
+}
+
+#[derive(Debug, Clone)]
+struct Toast {
+    message: String,
+    #[allow(dead_code)]
+    kind: ToastKind,
+    shown_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ToastKind {
+    Success,
+    Error,
+}
+
+impl Toast {
+    const DURATION_SECS: f32 = 4.5;
+    fn age(&self) -> f32 {
+        self.shown_at.elapsed().as_secs_f32()
+    }
+    fn alpha(&self) -> f32 {
+        (1.0 - (self.age() - Self::DURATION_SECS + 1.0).max(0.0)).clamp(0.0, 1.0)
+    }
+    fn visible(&self) -> bool {
+        self.age() <= Self::DURATION_SECS
+    }
+    fn color(&self) -> Color32 {
+        match self.kind {
+            ToastKind::Success => Color32::from_rgba_unmultiplied(40, 120, 60, 255),
+            ToastKind::Error => Color32::from_rgba_unmultiplied(170, 40, 40, 255),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -85,6 +122,8 @@ impl Default for GeoJsonToolkitApp {
             filter_edit: None,
             drag_col: None,
             respect_filters_on_export: true,
+            toast: None,
+            _last_feedback: String::new(),
         }
     }
 }
@@ -242,6 +281,13 @@ impl eframe::App for GeoJsonToolkitApp {
         self.top_bar(ctx);
         self.left_panel(ctx);
         self.central_panel(ctx);
+        if let Some(toast) = &self.toast {
+            if toast.visible() {
+                // keep animating the fade-out
+                ctx.request_repaint();
+            }
+        }
+        self.show_toast(ctx);
     }
 }
 
@@ -302,6 +348,8 @@ impl GeoJsonToolkitApp {
     fn file_info(&mut self, ui: &mut egui::Ui) {
         ui.heading("File");
         let mut pending_transform: Option<TransformDirection> = None;
+        #[allow(unused_assignments)]
+        let mut pending_export = false;
         match &self.dataset {
             Some((name, ds)) => {
                 ui.label(format!("Name: {name}"));
@@ -368,6 +416,15 @@ impl GeoJsonToolkitApp {
                         pending_transform = Some(TransformDirection::SoldnerBerlinToWgs84);
                     }
                 });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.label("Export current data:");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.respect_filters_on_export, "only filtered rows");
+                    if ui.button("Export GeoJSON…").clicked() {
+                        pending_export = true;
+                    }
+                });
                 // Soldner-Berlin area-of-use hint (only meaningful from WGS84).
                 let mut soldner_hint = false;
                 if ds.crs == Crs::Wgs84 {
@@ -404,6 +461,9 @@ impl GeoJsonToolkitApp {
         }
         if let Some(dir) = pending_transform {
             self.transform_dataset(dir);
+        }
+        if pending_export {
+            self.export_geojson();
         }
     }
 
@@ -516,6 +576,54 @@ impl GeoJsonToolkitApp {
     /// Transform all feature geometries between WGS84 and ETRS89 UTM 33N.
     /// Atomic: on any coordinate error, nothing is changed and the user gets
     /// a friendly message.
+    fn push_toast(&mut self, message: String, kind: ToastKind) {
+        self.toast = Some(Toast {
+            message,
+            kind,
+            shown_at: std::time::Instant::now(),
+        });
+    }
+
+    /// Toast overlay: fades out after a few seconds.
+    fn show_toast(&mut self, ctx: &egui::Context) {
+        let Some(toast) = &self.toast else { return };
+        if !toast.visible() {
+            self.toast = None;
+            return;
+        }
+        let toast = toast.clone();
+        let alpha = toast.alpha();
+        let window = egui::Window::new("feedback")
+            .anchor(Align2::CENTER_BOTTOM, [0.0, -28.0])
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .interactable(false)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(toast.color().gamma_multiply(alpha))
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        toast.color().linear_multiply(0.15).gamma_multiply(alpha),
+                    )),
+            );
+        window.show(ctx, |ui| {
+            ui.set_enabled(false);
+            let label = match toast.kind {
+                ToastKind::Success => format!("✔  {}", toast.message),
+                ToastKind::Error => format!("⚠  {}", toast.message),
+            };
+            egui::Frame::none()
+                .inner_margin(egui::Margin::symmetric(6.0, 0.0))
+                .show(ui, |ui| {
+                    ui.colored_label(
+                        Color32::WHITE.gamma_multiply(alpha),
+                        egui::RichText::new(label).strong().size(15.0),
+                    );
+                });
+        });
+    }
+
     fn transform_dataset(&mut self, direction: TransformDirection) {
         let Some((_, ds)) = &mut self.dataset else { return; };
         let (target_crs, project): (Crs, &dyn Fn(f64, f64) -> Result<(f64, f64), _>) = match direction {
@@ -540,20 +648,25 @@ impl GeoJsonToolkitApp {
                 Err(e) => {
                     self.status = format!("Transformation failed: {e}");
                     self.file_error = Some(format!("Transformation failed: {e}"));
+                    self.push_toast(format!("Transformation failed: {e}"), ToastKind::Error);
                     return;
                 }
             }
         }
+        let n = transformed.len();
         ds.features = transformed;
         ds.crs = target_crs;
         let (extent, vertices) = compute_extent(&ds.features);
         ds.extent = extent;
         ds.vertex_count = vertices;
-        self.status = format!(
-            "Transformed {} features to {}.",
-            ds.features.len(),
-            target_crs.label()
+        self.file_error = None;
+        let message = format!(
+            "Transformed {n} features to {} (EPSG:{})",
+            target_crs.label(),
+            target_crs.epsg()
         );
+        self.status = message.clone();
+        self.push_toast(message, ToastKind::Success);
     }
 
     // ---------- Phase 2: table editor ----------
@@ -876,10 +989,33 @@ impl GeoJsonToolkitApp {
         else {
             return;
         };
+        let (only_filtered, n) = (
+            self.respect_filters_on_export,
+            crate::model::table::TableState::visible_row_indices(
+                &self.table,
+                &ds.features,
+            )
+            .len(),
+        );
         let json = export_geojson(&ds.features, &self.table, self.respect_filters_on_export);
         match std::fs::write(&path, json) {
-            Ok(_) => self.status = format!("Exported {}.", path.display()),
-            Err(e) => self.status = format!("Export failed: {e}"),
+            Ok(_) => {
+                let message = format!(
+                    "Exported {only_filtered_label}to {}",
+                    path.display(),
+                    only_filtered_label = if only_filtered {
+                        format!("{n} of {} features ", ds.features.len())
+                    } else {
+                        format!("{} features ", ds.features.len())
+                    },
+                );
+                self.status = message.clone();
+                self.push_toast(message, ToastKind::Success);
+            }
+            Err(e) => {
+                self.status = format!("Export failed: {e}");
+                self.push_toast(format!("Export failed: {e}"), ToastKind::Error);
+            }
         }
     }
 
