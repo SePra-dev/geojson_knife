@@ -42,3 +42,14 @@ jobs:
         run: |
           SIZE=$(du -m target/x86_64-pc-windows-msvc/release/geojson_knife.exe | cut -f1)
           echo "Release EXE size: ${SIZE} MB"
+
+      - name: Upload portable Windows package
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeoJSON-Toolkit-Windows-portable
+          path: |
+            target/x86_64-pc-windows-msvc/release/geojson_knife.exe
+            README.md
+          retention-days: 30
+          if-no-files-found: error
